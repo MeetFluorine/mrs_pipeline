@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Supply Chain Intelligence Dashboard</title>
+<title>SDFX Supply Chain Intelligence Dashboard</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
@@ -529,6 +529,11 @@
 
   .progress-bar-wrap { background: var(--border); border-radius: 4px; height: 6px; overflow: hidden; }
   .progress-bar-fill { height: 100%; border-radius: 4px; transition: width 0.4s; }
+  .load-bar{display:none;height:6px;background:var(--border);border-radius:4px;overflow:hidden;margin:16px auto 0;max-width:520px}
+  .load-bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
+  .file-list{margin:12px auto 0;max-width:620px;text-align:left;font-size:12px;color:var(--text-secondary)}
+  .file-list div{display:flex;justify-content:space-between;gap:12px;padding:3px 0;border-bottom:1px solid var(--border)}
+  .file-list span:last-child{font-family:'JetBrains Mono',monospace;white-space:nowrap}
 </style>
 </head>
 <body>
@@ -538,8 +543,8 @@
   <div class="header-left">
     <div class="logo-mark">SC</div>
     <div>
-      <h1>Supply Chain Intelligence</h1>
-      <div class="sub">Inventory Movement & Distribution Analytics</div>
+      <h1>SDFX Supply Chain Intelligence</h1>
+      <div class="sub">SDFX locators only · MRS pendency</div>
     </div>
   </div>
   <div class="header-right">
@@ -553,10 +558,12 @@
   <!-- Upload Zone -->
   <div class="upload-zone" id="uploadZone">
     <div class="upload-icon">📊</div>
-    <h2>Drop your Excel / CSV file here</h2>
-    <p>Supports .xlsx, .xls, .csv — all column headers auto-detected</p>
-    <button class="upload-btn" onclick="document.getElementById('fileInput').click()">Choose File</button>
-    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
+    <h2>Drop your MRS file(s) here</h2>
+    <p>One or more .zip or .xlsx files (for example the two split MRS pendency zips). Only SDFX locators are kept.</p>
+    <button class="upload-btn" onclick="document.getElementById('fileInput').click()">Choose File(s)</button>
+    <input type="file" id="fileInput" accept=".zip,.xlsx,.xls,.csv" multiple>
+    <div class="load-bar" id="loadBar"><i id="lbar"></i></div>
+    <div id="fileList" class="file-list"></div>
   </div>
 
   <!-- Dashboard (hidden until data loaded) -->
@@ -605,7 +612,7 @@
         Applies all three business filters in sequence and prepares a clean Excel file for download.
       </div>
       <div class="sdfx-steps">
-        <div class="step-chip"><span>Step 1</span> Filter <b>SDFX</b> locators from Substore_Locator</div>
+        <div class="step-chip"><span>Step 1</span> Keep <b>SDFX</b> locators only (done while loading)</div>
         <div class="step-chip"><span>Step 2</span> Remove rows with blank DC_No</div>
         <div class="step-chip"><span>Step 3</span> Remove rows where DC_Date = Today</div>
       </div>
@@ -725,7 +732,7 @@
   <!-- Pre-upload placeholder -->
   <div id="placeholder" style="text-align:center;padding:40px 0;color:var(--text-muted);">
     <div style="font-size:48px;margin-bottom:12px">📂</div>
-    <p>Upload an Excel or CSV file above to begin analysis</p>
+    <p>Upload one or more MRS .zip / .xlsx files above to begin analysis</p>
   </div>
 
 </div><!-- /main -->
@@ -733,6 +740,127 @@
 <!-- Toast -->
 <div class="toast" id="toast"></div>
 
+<script type="text/js-worker" id="wsrc">
+const P=(pct,msg)=>postMessage({t:'p',pct,msg});
+async function openZip(blob){
+  const n=blob.size,tl=Math.min(n,66000),tail=new DataView(await blob.slice(n-tl).arrayBuffer());
+  let i=tl-22;while(i>=0&&tail.getUint32(i,true)!==0x06054b50)i--;
+  if(i<0)throw new Error('Not a valid zip / xlsx file');
+  const cnt=tail.getUint16(i+10,true),cs=tail.getUint32(i+12,true),co=tail.getUint32(i+16,true);
+  const cd=new DataView(await blob.slice(co,co+cs).arrayBuffer()),u8=new Uint8Array(cd.buffer),td=new TextDecoder(),ents={};
+  let p=0;
+  for(let k=0;k<cnt;k++){
+    const nl=cd.getUint16(p+28,true),el=cd.getUint16(p+30,true),cl=cd.getUint16(p+32,true);
+    ents[td.decode(u8.subarray(p+46,p+46+nl))]={method:cd.getUint16(p+10,true),csize:cd.getUint32(p+20,true),usize:cd.getUint32(p+24,true),off:cd.getUint32(p+42,true)};
+    p+=46+nl+el+cl;
+  }
+  return{blob,ents};
+}
+async function rawEntry(z,e){
+  const h=new DataView(await z.blob.slice(e.off,e.off+30).arrayBuffer()),s=e.off+30+h.getUint16(26,true)+h.getUint16(28,true);
+  return z.blob.slice(s,s+e.csize);
+}
+async function entryStream(z,e){const b=await rawEntry(z,e);return e.method===0?b.stream():b.stream().pipeThrough(new DecompressionStream('deflate-raw'))}
+async function* chunks(stream){const r=stream.getReader(),d=new TextDecoder();for(;;){const x=await r.read();if(x.done)break;yield d.decode(x.value,{stream:true})}}
+async function* sis(z,cb){
+  const e=z.ents['xl/sharedStrings.xml'];if(!e)throw new Error('This xlsx has no shared strings table. Use the original download, or re-save it from Excel.');
+  let buf='',done=0;const re=/<si(?:\/>|>([\s\S]*?)<\/si>)/g;
+  for await(const t of chunks(await entryStream(z,e))){
+    done+=t.length;buf+=t;const p=buf.lastIndexOf('</si>');if(p<0)continue;
+    const part=buf.slice(0,p+5);buf=buf.slice(p+5);let m;re.lastIndex=0;
+    while((m=re.exec(part)))yield m[1]||'';
+    cb(done/e.usize);
+  }
+  let m;re.lastIndex=0;while((m=re.exec(buf)))yield m[1]||'';
+}
+const ENT={amp:'&',lt:'<',gt:'>',quot:'"',apos:"'"};
+const dec=s=>s.replace(/&(#x[0-9a-f]+|#\d+|\w+);/gi,(a,b)=>b[0]==='#'?String.fromCodePoint(b[1]==='x'||b[1]==='X'?parseInt(b.slice(2),16):+b.slice(1)):(ENT[b]??a));
+const txtOf=s=>{let o='',m;const r=/<t(?:\s[^>]*)?>([^<]*)<\/t>/g;s=s.replace(/<rPh[\s\S]*?<\/rPh>/g,'');while((m=r.exec(s)))o+=m[1];return dec(o)};
+const attrs=s=>{const o={};s.replace(/([\w:]+)="([^"]*)"/g,(_,k,v)=>o[k]=v);return o};
+
+const mkDate=n=>{const u=new Date(Math.round((n-25569)*864e5));return new Date(u.getUTCFullYear(),u.getUTCMonth(),u.getUTCDate(),u.getUTCHours(),u.getUTCMinutes(),u.getUTCSeconds())};
+async function dateStyles(z){
+  const set=new Set(),e=z.ents['xl/styles.xml'];if(!e)return set;
+  const t=await new Response(await entryStream(z,e)).text(),cu={};
+  (t.match(/<numFmt\b[^>]*>/g)||[]).forEach(x=>{const a=attrs(x);cu[a.numFmtId]=dec(a.formatCode||'')});
+  const m=/<cellXfs\b[^>]*>([\s\S]*?)<\/cellXfs>/.exec(t);if(!m)return set;
+  (m[1].match(/<xf\b[^>]*>/g)||[]).forEach((x,i)=>{
+    const id=+attrs(x).numFmtId,b=(id>=14&&id<=22)||(id>=27&&id<=36)||(id>=45&&id<=47)||(id>=50&&id<=58);
+    const c=cu[id]!==undefined&&/[ymdhs]/i.test(cu[id].replace(/"[^"]*"|\[[^\]]*\]|\\./g,''));
+    if(b||c)set.add(i);
+  });
+  return set;
+}
+onmessage=async e=>{try{await run(e.data.file)}catch(x){postMessage({t:'err',m:String(x&&x.message||x)})}};
+
+async function run(file){
+  let z=await openZip(file);
+  if(!z.ents['xl/workbook.xml']){
+    const nm=Object.keys(z.ents).find(n=>/\.xlsx$/i.test(n));
+    if(!nm)throw new Error('No .xlsx found inside the zip');
+    P(0,'Unpacking zip…');
+    const en=z.ents[nm];let b=await rawEntry(z,en);
+    if(en.method!==0)b=await new Response(b.stream().pipeThrough(new DecompressionStream('deflate-raw'))).blob();
+    z=await openZip(b);
+  }
+  const txt=async n=>new Response(await entryStream(z,z.ents[n])).text();
+  const rel={};((await txt('xl/_rels/workbook.xml.rels')).match(/<Relationship\b[^>]*>/g)||[]).forEach(t=>{const a=attrs(t);rel[a.Id]=a.Target});
+  const sheets=((await txt('xl/workbook.xml')).match(/<sheet\b[^>]*>/g)||[]).map(t=>{const a=attrs(t);let p=rel[a['r:id']].replace(/^\//,'');if(!p.startsWith('xl/'))p='xl/'+p;return{name:a.name,path:p}});
+
+  // pass A: which shared strings contain "sdfx"
+  const flag=new Set(),head=[];let i=0;
+  for await(const s of sis(z,f=>P(f*.12,'Reading text table (1/3)…'))){if(i<64)head.push(txtOf(s));if(/sdfx/i.test(s))flag.add(i);i++}
+
+  const dstyle=await dateStyles(z);
+  // pass B: scan every sheet, keep rows whose substore_locator contains sdfx
+  const cell=/<c r="([A-Z]+)\d+"([^>]*)>(?:<v>([^<]*)<\/v>)?<\/c>/g;
+  const kept=[],need=new Set();let canon=null,scanned=0;
+  const tot=sheets.reduce((a,s)=>a+(z.ents[s.path]?.usize||0),0);let base=0;
+  for(const sh of sheets){
+    const e=z.ents[sh.path];if(!e)continue;
+    let buf='',done=0,names=null,map=null,locRe=null;
+    for await(const t of chunks(await entryStream(z,e))){
+      done+=t.length;buf+=t;const p=buf.lastIndexOf('</row>');
+      P(.12+.7*(base+done)/tot,`Scanning ${sh.name} – ${scanned.toLocaleString()} rows (2/3)…`);
+      if(p<0)continue;
+      const part=buf.slice(0,p);buf=buf.slice(p+6);
+      for(const r of part.split('</row>')){
+        if(r.indexOf('<c ')<0)continue;
+        if(!names){
+          names=[];let m;cell.lastIndex=0;
+          while((m=cell.exec(r))){const idx=m[1].charCodeAt(0)-65,sv=/ t="s"/.test(m[2])?head[+m[3]]:m[3];names[idx]=(sv||'').trim()}
+          const li=names.findIndex(n=>n.toLowerCase()==='substore_locator');
+          if(li<0){names=null;buf='';break}
+          if(!canon)canon=names.slice();
+          map=names.map(n=>canon.indexOf(n));
+          locRe=new RegExp('<c r="'+String.fromCharCode(65+li)+'\\d+"[^>]*><v>(\\d+)</v>');
+          continue;
+        }
+        scanned++;
+        const lm=locRe.exec(r);if(!lm||!flag.has(+lm[1]))continue;
+        const row=new Array(canon.length).fill(null);let m;cell.lastIndex=0;
+        while((m=cell.exec(r))){
+          const ci=map[m[1].charCodeAt(0)-65];if(ci==null||ci<0||m[3]===undefined)continue;
+          const ty=/ t="(\w+)"/.exec(m[2]);
+          if(ty&&ty[1]==='s'){row[ci]='s'+m[3];need.add(+m[3])}
+          else if(ty&&ty[1]!=='n')row[ci]=dec(m[3]);
+          else{const nv=Number(m[3]),sm=/ s="(\d+)"/.exec(m[2]);row[ci]=sm&&dstyle.has(+sm[1])?mkDate(nv):nv}
+        }
+        kept.push(row);
+      }
+      if(!names&&!canon)break;
+    }
+    base+=e.usize;
+  }
+  if(!canon)throw new Error('No sheet with a Substore_Locator column was found');
+
+  // pass C: resolve the text of the strings we kept
+  const got=new Map();i=0;
+  for await(const s of sis(z,f=>P(.82+.17*f,'Reading values (3/3)…'))){if(need.has(i))got.set(i,txtOf(s));i++}
+  const rows=kept.map(r=>r.map(v=>typeof v==='string'&&v[0]==='s'&&got.has(+v.slice(1))&&need.has(+v.slice(1))?got.get(+v.slice(1)):v));
+  postMessage({t:'done',hdr:canon,rows,scanned});
+}
+</script>
 <script>
 // ─────────────────────────────────────────────────────────────────────────────
 // GLOBALS
@@ -769,41 +897,112 @@ const COL = {
 // ─────────────────────────────────────────────────────────────────────────────
 // FILE UPLOAD
 // ─────────────────────────────────────────────────────────────────────────────
+let totalScanned = 0, busy = false;
 const uploadZone = document.getElementById('uploadZone');
 const fileInput  = document.getElementById('fileInput');
 
 uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('drag-over'); });
 uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag-over'));
-uploadZone.addEventListener('drop', e => { e.preventDefault(); uploadZone.classList.remove('drag-over'); handleFile(e.dataTransfer.files[0]); });
-fileInput.addEventListener('change', () => handleFile(fileInput.files[0]));
+uploadZone.addEventListener('drop', e => { e.preventDefault(); uploadZone.classList.remove('drag-over'); handleFiles([...e.dataTransfer.files]); });
+fileInput.addEventListener('change', () => { handleFiles([...fileInput.files]); fileInput.value = ''; });
 
-function handleFile(file) {
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = e => {
-    try {
-      const wb = XLSX.read(e.target.result, { type: 'binary', cellDates: true });
-      const TARGET_SHEET = 'Data_1';
-      if (!wb.SheetNames.includes(TARGET_SHEET)) {
-        toast(`❌ Sheet "${TARGET_SHEET}" not found. Available sheets: ${wb.SheetNames.join(', ')}`, 'error');
-        return;
-      }
-      const ws = wb.Sheets[TARGET_SHEET];
-      rawData = XLSX.utils.sheet_to_json(ws, { defval: '' });
-      if (!rawData.length) { toast(`Sheet "${TARGET_SHEET}" is empty or has no data rows`, 'error'); return; }
-      headers = Object.keys(rawData[0]);
-      normaliseData();
-      filteredData = [...rawData];
-      displayData = [...filteredData];
-      initDashboard();
-      toast(`✅ ${rawData.length.toLocaleString()} rows loaded from sheet "${TARGET_SHEET}" in "${file.name}"`, 'success');
-      document.getElementById('lastUpdated').textContent = new Date().toLocaleTimeString();
-      document.getElementById('dataPill').textContent = rawData.length + ' rows';
-    } catch(err) {
-      toast('Error parsing file: ' + err.message, 'error');
+// ---- streaming reader (zip / xlsx) runs in a worker so large files do not freeze the page ----
+function readWithWorker(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const w = new Worker(URL.createObjectURL(new Blob([document.getElementById('wsrc').textContent], { type: 'text/javascript' })));
+    w.onmessage = e => {
+      const d = e.data;
+      if (d.t === 'p') onProgress(d.pct, d.msg);
+      else if (d.t === 'err') { w.terminate(); reject(new Error(d.m)); }
+      else if (d.t === 'done') { w.terminate(); resolve(d); }
+    };
+    w.onerror = e => { w.terminate(); reject(new Error(e.message || 'Worker error')); };
+    w.postMessage({ file });
+  });
+}
+
+// ---- small-file fallback for .xls / .csv ----
+async function readLegacy(f) {
+  const wb = XLSX.read(await f.arrayBuffer(), { type: 'array', cellDates: true });
+  let hdr = null, rows = [], scanned = 0;
+  for (const n of wb.SheetNames) {
+    const a = XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, defval: '' });
+    if (!a.length) continue;
+    const h = a[0].map(x => String(x).trim());
+    const li = h.findIndex(x => x.toLowerCase() === 'substore_locator');
+    if (li < 0) continue;
+    if (!hdr) hdr = h;
+    const map = h.map(x => hdr.indexOf(x));
+    for (let i = 1; i < a.length; i++) {
+      scanned++;
+      if (!/sdfx/i.test(String(a[i][li] ?? ''))) continue;
+      const o = new Array(hdr.length).fill(null);
+      a[i].forEach((v, c) => { if (map[c] >= 0) o[map[c]] = v; });
+      rows.push(o);
     }
-  };
-  reader.readAsBinaryString(file);
+  }
+  if (!hdr) throw new Error('No sheet with a Substore_Locator column was found');
+  return { hdr, rows, scanned };
+}
+
+function renderFileList(list) {
+  document.getElementById('fileList').innerHTML = list.map(f =>
+    `<div><span>${esc(f.name)} (${(f.size/1048576).toFixed(1)} MB)</span><span>${esc(f.st)}</span></div>`).join('');
+}
+
+async function handleFiles(files) {
+  files = files.filter(f => /\.(zip|xlsx|xls|csv)$/i.test(f.name));
+  if (!files.length) { toast('Choose .zip, .xlsx, .xls or .csv files', 'error'); return; }
+  if (busy) { toast('Still processing the previous files', 'info'); return; }
+  busy = true;
+  const list = files.map(f => ({ name: f.name, size: f.size, st: 'Waiting' }));
+  renderFileList(list);
+  const bar = document.getElementById('loadBar'), lbar = document.getElementById('lbar');
+  bar.style.display = 'block'; lbar.style.width = '0';
+  const acc = { hdr: null, rows: [], scanned: 0 };
+  try {
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      list[i].st = 'Reading…'; renderFileList(list);
+      const r = /\.(zip|xlsx)$/i.test(f.name)
+        ? await readWithWorker(f, (pct, msg) => {
+            lbar.style.width = (((i + pct) / files.length) * 100).toFixed(1) + '%';
+            list[i].st = msg; renderFileList(list);
+          })
+        : await readLegacy(f);
+      if (!acc.hdr) acc.hdr = r.hdr.slice();
+      const map = r.hdr.map(h => acc.hdr.indexOf(h));
+      const same = map.length === acc.hdr.length && map.every((m, k) => m === k);
+      if (same) acc.rows = acc.rows.concat(r.rows);
+      else r.rows.forEach(row => {
+        const o = new Array(acc.hdr.length).fill(null);
+        row.forEach((v, c) => { if (map[c] >= 0) o[map[c]] = v; });
+        acc.rows.push(o);
+      });
+      acc.scanned += r.scanned;
+      list[i].st = `${r.rows.length.toLocaleString()} SDFX of ${r.scanned.toLocaleString()} rows`; renderFileList(list);
+      lbar.style.width = (((i + 1) / files.length) * 100).toFixed(1) + '%';
+    }
+    if (!acc.rows.length) { toast('No SDFX locator rows found in the selected file(s)', 'error'); return; }
+    headers = acc.hdr.filter(Boolean);
+    rawData = acc.rows.map(a => { const o = {}; acc.hdr.forEach((h, i) => { if (h) o[h] = a[i] ?? ''; }); return o; });
+    totalScanned = acc.scanned;
+    sdfxData = [];
+    ['ss-dcno','ss-final'].forEach(id => document.getElementById(id).textContent = '—');
+    document.getElementById('sdfxDownloadBtn').disabled = true;
+    document.getElementById('sdfxViewBtn').disabled = true;
+    normaliseData();
+    filteredData = [...rawData];
+    displayData = [...filteredData];
+    initDashboard();
+    toast(`✅ ${rawData.length.toLocaleString()} SDFX rows loaded from ${files.length} file${files.length > 1 ? 's' : ''}`, 'success');
+    document.getElementById('lastUpdated').textContent = new Date().toLocaleTimeString();
+    document.getElementById('dataPill').textContent = rawData.length.toLocaleString() + ' SDFX rows';
+  } catch (err) {
+    toast('Error reading file: ' + err.message, 'error');
+  } finally {
+    busy = false;
+  }
 }
 
 function normaliseData() {
@@ -812,6 +1011,10 @@ function normaliseData() {
     let d = row[COL.dcDate];
     if (d) {
       if (d instanceof Date) { row._dcDate = d; }
+      else if (typeof d === 'number') {
+        const u = new Date(Math.round((d - 25569) * 864e5));
+        row._dcDate = new Date(u.getUTCFullYear(), u.getUTCMonth(), u.getUTCDate(), u.getUTCHours(), u.getUTCMinutes(), u.getUTCSeconds());
+      }
       else {
         const s = String(d).trim();
         // Handle "11-DEC-2025" or "2025-12-10 00:00:00 +0530" etc.
@@ -831,6 +1034,8 @@ function normaliseData() {
 // INIT DASHBOARD
 // ─────────────────────────────────────────────────────────────────────────────
 function initDashboard() {
+  document.getElementById('ss-total').textContent = totalScanned.toLocaleString();
+  document.getElementById('ss-sdfx').textContent  = rawData.length.toLocaleString();
   document.getElementById('placeholder').classList.add('hidden');
   document.getElementById('dashboard').classList.remove('hidden');
   buildFilterControls();
@@ -996,7 +1201,7 @@ function runSdfxPipeline() {
   });
 
   sdfxData = step3;
-  document.getElementById('ss-total').textContent  = rawData.length.toLocaleString();
+  document.getElementById('ss-total').textContent  = totalScanned.toLocaleString();
   document.getElementById('ss-sdfx').textContent   = step1.length.toLocaleString();
   document.getElementById('ss-dcno').textContent   = step2.length.toLocaleString();
   document.getElementById('ss-final').textContent  = step3.length.toLocaleString();
