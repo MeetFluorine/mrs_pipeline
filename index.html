@@ -776,6 +776,9 @@ async function* sis(z,cb){
 const ENT={amp:'&',lt:'<',gt:'>',quot:'"',apos:"'"};
 const dec=s=>s.replace(/&(#x[0-9a-f]+|#\d+|\w+);/gi,(a,b)=>b[0]==='#'?String.fromCodePoint(b[1]==='x'||b[1]==='X'?parseInt(b.slice(2),16):+b.slice(1)):(ENT[b]??a));
 const txtOf=s=>{let o='',m;const r=/<t(?:\s[^>]*)?>([^<]*)<\/t>/g;s=s.replace(/<rPh[\s\S]*?<\/rPh>/g,'');while((m=r.exec(s)))o+=m[1];return dec(o)};
+const colIdx=s=>{let n=0;for(const ch of s)n=n*26+ch.charCodeAt(0)-64;return n-1};
+const colName=i=>{let s='';for(i++;i>0;i=Math.floor((i-1)/26))s=String.fromCharCode(65+(i-1)%26)+s;return s};
+const mapHdr=(names,canon)=>{const used=new Set();return names.map(n=>{const k=(n||'').toLowerCase();for(let j=0;j<canon.length;j++)if(!used.has(j)&&(canon[j]||'').toLowerCase()===k){used.add(j);return j}return -1})};
 const attrs=s=>{const o={};s.replace(/([\w:]+)="([^"]*)"/g,(_,k,v)=>o[k]=v);return o};
 
 const mkDate=n=>{const u=new Date(Math.round((n-25569)*864e5));return new Date(u.getUTCFullYear(),u.getUTCMonth(),u.getUTCDate(),u.getUTCHours(),u.getUTCMinutes(),u.getUTCSeconds())};
@@ -809,7 +812,7 @@ async function run(file){
 
   // pass A: which shared strings contain "sdfx"
   const flag=new Set(),head=[];let i=0;
-  for await(const s of sis(z,f=>P(f*.12,'Reading text table (1/3)…'))){if(i<64)head.push(txtOf(s));if(/sdfx/i.test(s))flag.add(i);i++}
+  for await(const s of sis(z,f=>P(f*.12,'Reading text table (1/3)…'))){if(i<4096)head.push(txtOf(s));if(/sdfx/i.test(s))flag.add(i);i++}
 
   const dstyle=await dateStyles(z);
   // pass B: scan every sheet, keep rows whose substore_locator contains sdfx
@@ -828,19 +831,19 @@ async function run(file){
         if(r.indexOf('<c ')<0)continue;
         if(!names){
           names=[];let m;cell.lastIndex=0;
-          while((m=cell.exec(r))){const idx=m[1].charCodeAt(0)-65,sv=/ t="s"/.test(m[2])?head[+m[3]]:m[3];names[idx]=(sv||'').trim()}
+          while((m=cell.exec(r))){const idx=colIdx(m[1]),sv=/ t="s"/.test(m[2])?head[+m[3]]:dec(m[3]||'');names[idx]=(sv||'').trim()}
+          for(let k=0;k<names.length;k++)if(names[k]==null)names[k]='';
           const li=names.findIndex(n=>n.toLowerCase()==='substore_locator');
           if(li<0){names=null;buf='';break}
-          if(!canon)canon=names.slice();
-          map=names.map(n=>canon.indexOf(n));
-          locRe=new RegExp('<c r="'+String.fromCharCode(65+li)+'\\d+"[^>]*><v>(\\d+)</v>');
+          if(!canon){canon=names.slice();map=names.map((_,k)=>k)}else map=mapHdr(names,canon);
+          locRe=new RegExp('<c r="'+colName(li)+'\\d+"[^>]*><v>(\\d+)</v>');
           continue;
         }
         scanned++;
         const lm=locRe.exec(r);if(!lm||!flag.has(+lm[1]))continue;
         const row=new Array(canon.length).fill(null);let m;cell.lastIndex=0;
         while((m=cell.exec(r))){
-          const ci=map[m[1].charCodeAt(0)-65];if(ci==null||ci<0||m[3]===undefined)continue;
+          const ci=map[colIdx(m[1])];if(ci==null||ci<0||m[3]===undefined)continue;
           const ty=/ t="(\w+)"/.exec(m[2]);
           if(ty&&ty[1]==='s'){row[ci]='s'+m[3];need.add(+m[3])}
           else if(ty&&ty[1]!=='n')row[ci]=dec(m[3]);
@@ -871,6 +874,8 @@ let displayData = [];   // after table search
 let sdfxData = [];      // SDFX pipeline result
 let charts = {};
 let headers = [];
+let rawHdr = [];      // full header row of the raw file, in raw column order
+const mapHdr = (names, canon) => { const used = new Set(); return names.map(n => { const k = String(n ?? '').toLowerCase(); for (let j = 0; j < canon.length; j++) if (!used.has(j) && String(canon[j] ?? '').toLowerCase() === k) { used.add(j); return j; } return -1; }); };
 let dateMin = null, dateMax = null;
 let sortCol = null, sortDir = 1;
 const PAGE_SIZE = 200;
@@ -932,7 +937,7 @@ async function readLegacy(f) {
     const li = h.findIndex(x => x.toLowerCase() === 'substore_locator');
     if (li < 0) continue;
     if (!hdr) hdr = h;
-    const map = h.map(x => hdr.indexOf(x));
+    const map = mapHdr(h, hdr);
     for (let i = 1; i < a.length; i++) {
       scanned++;
       if (!/sdfx/i.test(String(a[i][li] ?? ''))) continue;
@@ -971,7 +976,7 @@ async function handleFiles(files) {
           })
         : await readLegacy(f);
       if (!acc.hdr) acc.hdr = r.hdr.slice();
-      const map = r.hdr.map(h => acc.hdr.indexOf(h));
+      const map = mapHdr(r.hdr, acc.hdr);
       const same = map.length === acc.hdr.length && map.every((m, k) => m === k);
       if (same) acc.rows = acc.rows.concat(r.rows);
       else r.rows.forEach(row => {
@@ -985,7 +990,8 @@ async function handleFiles(files) {
     }
     if (!acc.rows.length) { toast('No SDFX locator rows found in the selected file(s)', 'error'); return; }
     headers = acc.hdr.filter(Boolean);
-    rawData = acc.rows.map(a => { const o = {}; acc.hdr.forEach((h, i) => { if (h) o[h] = a[i] ?? ''; }); return o; });
+    rawHdr = acc.hdr.map(h => h ?? '');
+    rawData = acc.rows.map(a => { const o = {}; acc.hdr.forEach((h, i) => { if (h) o[h] = a[i] ?? ''; }); Object.defineProperty(o, '_cells', { value: a, enumerable: false }); return o; });
     totalScanned = acc.scanned;
     sdfxData = [];
     ['ss-dcno','ss-final'].forEach(id => document.getElementById(id).textContent = '—');
@@ -1467,17 +1473,14 @@ function downloadFilteredExcel() {
 }
 
 function exportToExcel(data, filename) {
-  // strip internal keys
-  const clean = data.map(r => {
-    const o = {};
-    headers.forEach(h => { o[h] = r[h]; });
-    return o;
-  });
-  const ws = XLSX.utils.json_to_sheet(clean);
+  // Write rows by position so the columns come out exactly in the raw file's order
+  // (blank / duplicate header names included), all in one sheet.
+  const aoa = [rawHdr, ...data.map(r => rawHdr.map((_, i) => { const v = r._cells ? r._cells[i] : undefined; return v == null ? '' : v; }))];
+  const ws = XLSX.utils.aoa_to_sheet(aoa, { cellDates: true, dateNF: 'dd-mm-yyyy hh:mm' });
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Data');
   // Column widths
-  ws['!cols'] = headers.map(() => ({ wch: 18 }));
+  ws['!cols'] = rawHdr.map(() => ({ wch: 18 }));
   XLSX.writeFile(wb, filename);
   toast(`⬇ "${filename}" downloaded (${data.length} rows)`, 'success');
 }
